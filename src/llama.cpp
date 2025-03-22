@@ -1870,6 +1870,11 @@ struct llama_mmap {
                         strerror(errno));
             }
         }
+        LLAMA_LOG_INFO("Setting posix_madvise(MADV_HUGEPAGE) in an attempt to enable THP for correct system configurations!\n");
+        if (posix_madvise(addr, file->size, MADV_HUGEPAGE)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., MADV_HUGEPAGE) failed: %s\n",
+                    strerror(errno));
+        }
 
         // initialize list of mapped_fragments
         mapped_fragments.emplace_back(0, file->size);
