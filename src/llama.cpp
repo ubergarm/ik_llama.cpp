@@ -1619,6 +1619,7 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_MONARCH,
     LLM_CHAT_TEMPLATE_GEMMA,
     LLM_CHAT_TEMPLATE_ORION,
+    LLM_CHAT_TEMPLATE_OPENBUDDY,
     LLM_CHAT_TEMPLATE_OPENCHAT,
     LLM_CHAT_TEMPLATE_VICUNA,
     LLM_CHAT_TEMPLATE_VICUNA_ORCA,
@@ -1656,6 +1657,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "monarch",           LLM_CHAT_TEMPLATE_MONARCH           },
     { "gemma",             LLM_CHAT_TEMPLATE_GEMMA             },
     { "orion",             LLM_CHAT_TEMPLATE_ORION             },
+    { "openbuddy",         LLM_CHAT_TEMPLATE_OPENBUDDY         },
     { "openchat",          LLM_CHAT_TEMPLATE_OPENCHAT          },
     { "vicuna",            LLM_CHAT_TEMPLATE_VICUNA            },
     { "vicuna-orca",       LLM_CHAT_TEMPLATE_VICUNA_ORCA       },
@@ -7336,7 +7338,7 @@ static bool llm_load_tensors(
 
                     // output
                     model.output_norm = create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                    model.output      = create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED); 
+                    model.output      = create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                     // if output is NULL, init from the input tok embed
                     if (model.output == NULL) {
@@ -7345,7 +7347,7 @@ static bool llm_load_tensors(
 
                     for (int i = 0; i < n_layer; ++i) {
 			ggml_context * ctx_layer = ctx_for_layer(i);
-                        ggml_context * ctx_split = ctx_for_layer_split(i);			
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
 
                         auto & layer = model.layers[i];
                         const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(i);
@@ -7357,7 +7359,7 @@ static bool llm_load_tensors(
 
                         if (n_head_kv == 0 && n_head > 0) {
                             // linear attention for DeciLMCausalModel
-                            layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});                       
+                            layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
 			    layer.wo = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
                         }
                         else if (n_head_kv > 0) {
@@ -7370,8 +7372,8 @@ static bool llm_load_tensors(
                         }
 
                         // optional bias tensors
-			
-			
+
+
                         layer.bq = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
                         layer.bk = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         layer.bv = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
@@ -22676,6 +22678,8 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
     } else if (tmpl_contains("'\\n\\nAssistant: ' + eos_token")) {
         // OrionStarAI/Orion-14B-Chat
         return LLM_CHAT_TEMPLATE_ORION;
+    } else if (tmpl_contains("<|role|>") && tmpl_contains("<|says|>")) {
+        return LLM_CHAT_TEMPLATE_OPENBUDDY;
     } else if (tmpl_contains("GPT4 Correct ")) {
         // openchat/openchat-3.5-0106
         return LLM_CHAT_TEMPLATE_OPENCHAT;
@@ -22891,6 +22895,15 @@ static int32_t llama_chat_apply_template_internal(
             } else {
                 ss << message->content << "</s>";
             }
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_OPENBUDDY) {
+        // OpenBuddy
+        // https://huggingface.co/OpenBuddy/OpenBuddy-R1-0528-Distill-Qwen3-32B-Preview0-QAT#prompt-format
+        for (auto message : chat) {
+            ss << "<|role|>" << message->role << "<|says|>" << message->content << "<|end|>\n";
+        }
+        if (add_ass) {
+            ss << "<|role|>assistant<|says|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_OPENCHAT) {
         // openchat/openchat-3.5-0106,
