@@ -235,6 +235,7 @@ enum llm_arch {
     LLM_ARCH_GRANITE,
     LLM_ARCH_GRANITE_MOE,
     LLM_ARCH_COHERE2,
+    LLM_ARCH_HUNYUAN_MOE,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -291,6 +292,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GRANITE,         "granite"      },
     { LLM_ARCH_GRANITE_MOE,     "granitemoe"   },
     { LLM_ARCH_COHERE2,         "cohere2"      },
+    { LLM_ARCH_HUNYUAN_MOE,     "hunyuan-moe"  },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -1596,6 +1598,30 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_HUNYUAN_MOE,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_ROT_EMBD,   "blk.%d.attn_rot_embd" },
+            { LLM_TENSOR_FFN_GATE_INP,    "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE_SHEXP,  "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_SHEXP,  "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP,    "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,   "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
+        },
+    },
+    {
         LLM_ARCH_UNKNOWN,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
@@ -1638,6 +1664,7 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_MEGREZ,
     LLM_CHAT_TEMPLATE_LLAMA4,
     LLM_CHAT_TEMPLATE_BITNET,
+    LLM_CHAT_TEMPLATE_HUNYUAN_MOE,
     LLM_CHAT_TEMPLATE_UNKNOWN,
 };
 
@@ -1675,6 +1702,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "gigachat",          LLM_CHAT_TEMPLATE_GIGACHAT          },
     { "megrez",            LLM_CHAT_TEMPLATE_MEGREZ            },
     { "llama4",            LLM_CHAT_TEMPLATE_LLAMA4            },
+    { "hunyuan-moe",       LLM_CHAT_TEMPLATE_HUNYUAN_MOE       },
     { "bitnet",            LLM_CHAT_TEMPLATE_BITNET            },
 };
 
@@ -2570,6 +2598,7 @@ enum e_model {
     MODEL_27B,
     MODEL_17B_16E,
     MODEL_17B_128E,
+    MODEL_A13B,
 };
 
 static const size_t kiB = 1024;
@@ -5201,6 +5230,7 @@ static const char * llama_model_type_name(e_model type) {
         case MODEL_27B:           return "27B";
         case MODEL_17B_16E:       return "17Bx16E (Scout)";
         case MODEL_17B_128E:      return "17Bx128E (Maverick)";
+        case MODEL_A13B:          return "A13B";
         default:                  return "?B";
     }
 }
@@ -6032,6 +6062,18 @@ static void llm_load_hparams(
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
                 switch (hparams.n_layer) {
                     case 32: model.type = e_model::MODEL_8B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_HUNYUAN_MOE:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                hparams.n_ff_exp      = hparams.n_ff(0);
+                hparams.n_ff_shexp    = hparams.n_ff_exp;
+
+                switch (hparams.n_layer) {
+                    case 32: model.type = e_model::MODEL_A13B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
@@ -7341,7 +7383,7 @@ static bool llm_load_tensors(
 
                     // output
                     model.output_norm = create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                    model.output      = create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED); 
+                    model.output      = create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                     // if output is NULL, init from the input tok embed
                     if (model.output == NULL) {
@@ -7350,7 +7392,7 @@ static bool llm_load_tensors(
 
                     for (int i = 0; i < n_layer; ++i) {
 			ggml_context * ctx_layer = ctx_for_layer(i);
-                        ggml_context * ctx_split = ctx_for_layer_split(i);			
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
 
                         auto & layer = model.layers[i];
                         const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(i);
@@ -7362,7 +7404,7 @@ static bool llm_load_tensors(
 
                         if (n_head_kv == 0 && n_head > 0) {
                             // linear attention for DeciLMCausalModel
-                            layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});                       
+                            layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
 			    layer.wo = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd});
                         }
                         else if (n_head_kv > 0) {
@@ -7375,8 +7417,8 @@ static bool llm_load_tensors(
                         }
 
                         // optional bias tensors
-			
-			
+
+
                         layer.bq = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
                         layer.bk = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         layer.bv = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
@@ -22732,6 +22774,8 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_MEGREZ;
     } else if (tmpl_contains("<|header_start|>") && tmpl_contains("<|header_end|>")) {
         return LLM_CHAT_TEMPLATE_LLAMA4;
+    } else if (tmpl_contains("<|startoftext|>") && tmpl_contains("<|extra_4|>")) {
+        return LLM_CHAT_TEMPLATE_HUNYUAN_MOE;
     }
     return LLM_CHAT_TEMPLATE_UNKNOWN;
 }
@@ -23149,6 +23193,21 @@ static int32_t llama_chat_apply_template_internal(
             } else {
                 ss << message->content;
             }
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_HUNYUAN_MOE) {
+        // tencent/Hunyuan-A13B-Instruct
+        for (auto message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                ss << "<|startoftext|>" << message->content << "<|extra_4|>";
+            } else if (role == "assistant") {
+                ss << "<|startoftext|>" << message->content << "<|eos|>";
+            } else {
+                ss << "<|startoftext|>" << message->content << "<|extra_0|>";
+            }
+        }
+        if (add_ass) {
+            ss << "<|startoftext|>";
         }
     } else {
         // template not supported
