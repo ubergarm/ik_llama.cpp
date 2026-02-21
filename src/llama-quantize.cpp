@@ -1207,24 +1207,32 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     };
 
     const auto tn = LLM_TN(model.arch);
-    new_ofstream(0);
+
+    // no output file for --dry-run
+    if (!params->dry_run) {
+        new_ofstream(0);
+    }
+
     for (int i = 0; i < ml.n_tensors; ++i) {
         auto weight = ml.get_weight(i);
         struct ggml_tensor * tensor = weight->tensor;
-        if (weight->idx != cur_split && params->keep_split) {
+        if (!params->dry_run && (weight->idx != cur_split && params->keep_split)) {
             close_ofstream();
             new_ofstream(weight->idx);
         }
 
         const std::string name = ggml_get_name(tensor);
+        const size_t tensor_size = ggml_nbytes(tensor);
 
-        if (!ml.use_mmap) {
-            if (read_data.size() < ggml_nbytes(tensor)) {
-                read_data.resize(ggml_nbytes(tensor));
+        if (!params->dry_run) {
+            if (!ml.use_mmap) {
+                if (read_data.size() < tensor_size) {
+                    read_data.resize(tensor_size);
+                }
+                tensor->data = read_data.data();
             }
-            tensor->data = read_data.data();
+            ml.load_data_for(tensor);
         }
-        ml.load_data_for(tensor);
 
         LLAMA_LOG_INFO("[%4d/%4d] %36s - [%s], type = %6s, ",
                ++idx, ml.n_tensors,
@@ -1377,12 +1385,30 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             quantize = tensor->type != new_type;
         }
 
-        if (!quantize) {
-            new_type = tensor->type;
-            new_data = tensor->data;
-            new_size = ggml_nbytes(tensor);
-            LLAMA_LOG_INFO("size = %8.3f MB\n", ggml_nbytes(tensor)/1024.0/1024.0);
+        // we have now decided on the target type for this tensor
+        if (params->dry_run) {
+            // the --dry-run option calculates the final quantization size without quantizting
+            if (quantize) {
+                new_size = ggml_nrows(tensor) * ggml_row_size(new_type, tensor->ne[0]);
+                LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (%s)\n",
+                               tensor_size/1024.0/1024.0,
+                               new_size/1024.0/1024.0,
+                               ggml_type_name(new_type));
+            } else {
+                new_size = tensor_size;
+                LLAMA_LOG_INFO("size = %8.3f MiB\n", new_size/1024.0/1024.0);
+            }
+            total_size_org += tensor_size;
+            total_size_new += new_size;
+            continue;
         } else {
+            // no --dry-run, perform quantization
+            if (!quantize) {
+                new_type = tensor->type;
+                new_data = tensor->data;
+                new_size = tensor_size;
+                LLAMA_LOG_INFO("size = %8.3f MiB\n", tensor_size/1024.0/1024.0);
+            } else {
             const int64_t nelements = ggml_nelements(tensor);
 
             const float * imatrix = nullptr;
@@ -1495,28 +1521,28 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
                 new_size += llama_tensor_quantize_internal(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
             }
-            LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0, new_size/1024.0/1024.0);
-        }
+                LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
+            }
+            total_size_org += tensor_size;
+            total_size_new += new_size;
+
+            // update the gguf meta data as we go
+            gguf_set_tensor_type(ctx_outs[cur_split], name.c_str(), new_type);
+            gguf_set_tensor_data(ctx_outs[cur_split], name.c_str(), new_data, new_size);
+
+            // write tensor data + padding
+            fout.write((const char *) new_data, new_size);
+            zeros(fout, GGML_PAD(new_size, align) - new_size);
+        } // no --dry-run
+    } // iterate over tensors
 
 QuantizationDone:;
-        total_size_org += ggml_nbytes(tensor);
-        total_size_new += new_size;
-
-        // update the gguf meta data as we go
-        gguf_set_tensor_type(ctx_outs[cur_split], name.c_str(), new_type);
-        gguf_set_tensor_data(ctx_outs[cur_split], name.c_str(), new_data, new_size);
-
-        // write tensor data + padding
-        fout.write((const char *) new_data, new_size);
-        zeros(fout, GGML_PAD(new_size, align) - new_size);
-    }
-    close_ofstream();
-    for (auto & c:ctx_outs) {
-        gguf_free(c);
+    if (!params->dry_run) {
+        close_ofstream();
     }
 
-    LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
-    LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
+    LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
 
     if (qs.n_fallback > 0) {
         LLAMA_LOG_WARN("%s: WARNING: %d of %d tensor(s) required fallback quantization\n",
