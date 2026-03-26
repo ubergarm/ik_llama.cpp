@@ -14690,6 +14690,198 @@ void quantize_row_iq1_m  (const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
     quantize_row_iq1_m_ref(x, (block_iq1_m *)y, k);
 }
 
+// ============================ TurboQuant TQ3_0: WHT rotation + 3-bit Lloyd-Max codebook
+
+// Lloyd-Max 8-level codebook centroids for N(0,1)
+static const float TQ3_0_CENTROIDS[8] = {
+    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1519f
+};
+
+// Decision boundaries (midpoints between adjacent centroids)
+static const float TQ3_0_BOUNDARIES[7] = {
+    -1.7479f, -1.0500f, -0.5005f, 0.0f, 0.5005f, 1.0500f, 1.7479f
+};
+
+// Deterministic sign flip pattern for randomized Hadamard transform
+static const float TQ3_0_SIGNS[32] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+};
+
+// Forward randomized Hadamard transform: sign flips + WHT + normalize
+static void tq3_0_rht_forward(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    for (int i = 0; i < 32; i++) {
+        out[i] = in[i] * TQ3_0_SIGNS[i];
+    }
+
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j]        = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) {
+        out[i] *= norm;
+    }
+}
+
+// Inverse randomized Hadamard transform: WHT + normalize + undo sign flips
+static void tq3_0_rht_inverse(const float * GGML_RESTRICT in, float * GGML_RESTRICT out) {
+    for (int i = 0; i < 32; i++) {
+        out[i] = in[i];
+    }
+
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j]        = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) {
+        out[i] *= norm * TQ3_0_SIGNS[i];
+    }
+}
+
+void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    const int64_t nb = k / QK_TQ3_0;
+
+    float rotated[QK_TQ3_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * block_x = x + i * QK_TQ3_0;
+
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            sum_sq += block_x[j] * block_x[j];
+        }
+        float rms = sqrtf(sum_sq / QK_TQ3_0);
+        if (rms < 1e-10f) { rms = 1.0f; }
+
+        y[i].d = GGML_FP32_TO_FP16(rms);
+
+        float normalized[QK_TQ3_0];
+        const float inv_rms = 1.0f / rms;
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            normalized[j] = block_x[j] * inv_rms;
+        }
+
+        tq3_0_rht_forward(normalized, rotated);
+
+        uint8_t indices[QK_TQ3_0];
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            float v = rotated[j];
+            uint8_t idx = 0;
+            for (int b = 0; b < 7; b++) {
+                if (v > TQ3_0_BOUNDARIES[b]) { idx = b + 1; }
+            }
+            indices[j] = idx;
+        }
+
+        for (int g = 0; g < 4; g++) {
+            const uint8_t * idx = indices + g * 8;
+            uint8_t * qp = y[i].qs + g * 3;
+            qp[0] = (idx[0])      | (idx[1] << 3) | (idx[2] << 6);
+            qp[1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);
+            qp[2] = (idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5);
+        }
+    }
+}
+
+void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    const int64_t nb = k / QK_TQ3_0;
+
+    float rotated[QK_TQ3_0];
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        uint8_t indices[QK_TQ3_0];
+        for (int g = 0; g < 4; g++) {
+            const uint8_t * qp = x[i].qs + g * 3;
+            uint8_t * idx = indices + g * 8;
+            idx[0] =  qp[0]       & 7;
+            idx[1] = (qp[0] >> 3) & 7;
+            idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
+            idx[3] = (qp[1] >> 1) & 7;
+            idx[4] = (qp[1] >> 4) & 7;
+            idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
+            idx[6] = (qp[2] >> 2) & 7;
+            idx[7] = (qp[2] >> 5) & 7;
+        }
+
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            rotated[j] = TQ3_0_CENTROIDS[indices[j]];
+        }
+
+        float dequantized[QK_TQ3_0];
+        tq3_0_rht_inverse(rotated, dequantized);
+
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            y[i * QK_TQ3_0 + j] = dequantized[j] * d;
+        }
+    }
+}
+
+void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    block_tq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tq3_0_ref(x, y, k);
+}
+
+size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);
+    quantize_row_tq3_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+void ggml_vec_dot_tq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_TQ3_0 == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(bs);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ3_0;
+
+    float sumf = 0.0f;
+    float tmp[QK_TQ3_0];
+
+    for (int i = 0; i < nb; ++i) {
+        dequantize_row_tq3_0(&x[i], tmp, QK_TQ3_0);
+
+        const float d_q8 = GGML_FP16_TO_FP32(y[i].d);
+        float dot = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            dot += tmp[j] * (float)y[i].qs[j];
+        }
+        sumf += dot * d_q8;
+    }
+
+    *s = sumf;
+}
+
 // ============================ 4-bit non-linear quants
 
 static const int8_t iq4nl_index[241] = {

@@ -421,6 +421,7 @@ extern "C" {
         GGML_TYPE_Q4_0_4_8 = 32,
         GGML_TYPE_Q4_0_8_8 = 33,
         GGML_TYPE_MXFP4    = 39,  // so we are compatible with mainline
+        GGML_TYPE_TQ3_0    = 41,  // TurboQuant 3-bit (WHT rotation + Lloyd-Max codebook)
         //
         // So we are able to consume MS BitNet I2_S quants
         //
