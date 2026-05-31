@@ -1356,10 +1356,81 @@ int main(int argc, char ** argv) {
     const auto handle_infill = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         log_prompt(ctx_server.params_base, json::parse(req.body));
         json data = json::parse(req.body);
-        const int id_task = ctx_server.queue_tasks.get_new_id();
-        server_tokens token; // dummy tokens
-        ctx_server.queue_results.add_waiting_task_id(id_task);
-        ctx_server.request_completion(id_task, -1, data, true, false, std::move(token));
+
+        // validate required fields
+        if (!data.contains("input_prefix")) {
+            res_err(res, format_error_response("\"input_prefix\" is required", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (!data.contains("input_suffix")) {
+            res_err(res, format_error_response("\"input_suffix\" is required", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // build FIM token sequence: [extra] [BOS] [FIM_PRE]prefix [FIM_SUF]suffix [FIM_MID]
+        const auto * vocab = llama_model_get_vocab(ctx_server.model);
+        const bool add_bos = llama_vocab_get_add_bos(vocab);
+        const llama_token fim_rep = llama_vocab_fim_rep(vocab);
+        const llama_token fim_sep = llama_vocab_fim_sep(vocab);
+
+        std::string input_prefix = data.at("input_prefix").get<std::string>();
+        std::string input_suffix = data.at("input_suffix").get<std::string>();
+        std::string prompt_str   = json_value(data, "prompt", std::string());
+
+        // tokenize prefix, suffix, and middle prompt
+        auto tokens_prefix = common_tokenize(vocab, input_prefix, false, false);
+        auto tokens_suffix = common_tokenize(vocab, input_suffix, false, false);
+        auto tokens_prompt = prompt_str.empty() ? std::vector<llama_token>() : common_tokenize(vocab, prompt_str, false, false);
+
+        // strip leading space token from suffix
+        const int space_token = 29871;
+        if (!tokens_suffix.empty() && tokens_suffix.front() == space_token) {
+            tokens_suffix.erase(tokens_suffix.begin());
+        }
+
+        // build repo-level extra context
+        std::vector<llama_token> extra_tokens;
+        if (fim_rep != LLAMA_TOKEN_NULL) {
+            extra_tokens.push_back(fim_rep);
+            auto repo_tok = common_tokenize(vocab, "myproject\n", false, false);
+            extra_tokens.insert(extra_tokens.end(), repo_tok.begin(), repo_tok.end());
+        }
+        if (data.contains("input_extra") && data.at("input_extra").is_array()) {
+            for (const auto & chunk : data.at("input_extra")) {
+                std::string text, filename = "tmp";
+                if (chunk.is_object()) {
+                    text     = chunk.value("text",     std::string());
+                    filename = chunk.value("filename", std::string("tmp"));
+                } else if (chunk.is_string()) {
+                    text = chunk.get<std::string>();
+                }
+                if (fim_sep != LLAMA_TOKEN_NULL && !text.empty()) {
+                    extra_tokens.push_back(fim_sep);
+                    auto fname_tok = common_tokenize(vocab, filename + "\n", false, false);
+                    extra_tokens.insert(extra_tokens.end(), fname_tok.begin(), fname_tok.end());
+                }
+                if (!text.empty()) {
+                    auto tok = common_tokenize(vocab, text, false, false);
+                    extra_tokens.insert(extra_tokens.end(), tok.begin(), tok.end());
+                }
+            }
+        }
+
+        // assemble final sequence
+        auto embd_inp = extra_tokens;
+        if (add_bos) embd_inp.push_back(llama_vocab_bos(vocab));
+        embd_inp.push_back(llama_token_prefix(ctx_server.model));
+        embd_inp.insert(embd_inp.end(), tokens_prefix.begin(), tokens_prefix.end());
+        embd_inp.push_back(llama_token_suffix(ctx_server.model));
+        embd_inp.insert(embd_inp.end(), tokens_suffix.begin(), tokens_suffix.end());
+        if (!tokens_prompt.empty()) {
+            embd_inp.insert(embd_inp.end(), tokens_prompt.begin(), tokens_prompt.end());
+        }
+        embd_inp.push_back(llama_token_middle(ctx_server.model));
+
+        // store as token array so handle_completions_impl uses it directly
+        data["prompt"] = json(embd_inp);
+
         std::vector<raw_buffer> files; // dummy
         handle_completions_impl(
             SERVER_TASK_TYPE_INFILL,

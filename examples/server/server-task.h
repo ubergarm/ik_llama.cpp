@@ -63,6 +63,7 @@ struct slot_params {
     bool post_sampling_probs = false;
     json input_prefix;
     json input_suffix;
+    json input_extra;  // repo-level FIM extra context [{text, filename}]
 
     // speculative decoding parameters
     struct common_params_speculative speculative;

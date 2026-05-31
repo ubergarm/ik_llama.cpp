@@ -1411,6 +1411,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     // infill
     slot.params.input_prefix = json_value(data, "input_prefix", defaults.input_prefix);
     slot.params.input_suffix = json_value(data, "input_suffix", defaults.input_suffix);
+    slot.params.input_extra  = json_value(data, "input_extra",  json::array());
 
     // get prompt
     if (!task.infill) {
@@ -3779,6 +3780,53 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             suffix_tokens.erase(suffix_tokens.begin());
                         }
 
+                        // repo-level extra context (stable prefix for KV cache reuse)
+                        // input_extra is [{text, filename}, ...] or [string, ...] or [token_id, ...]
+                        // format: [FIM_REP]myproject\n[FIM_SEP]filename\n<text>...
+                        std::vector<llama_token> extra_tokens;
+                        const auto * vocab = llama_model_get_vocab(model);
+                        const llama_token fim_rep = llama_vocab_fim_rep(vocab);
+                        const llama_token fim_sep = llama_vocab_fim_sep(vocab);
+                        if (fim_rep != LLAMA_TOKEN_NULL) {
+                            extra_tokens.push_back(fim_rep);
+                            auto repo_tok = ::common_tokenize(ctx, "myproject\n", false, true);
+                            extra_tokens.insert(extra_tokens.end(), repo_tok.begin(), repo_tok.end());
+                        }
+                        if (slot.params.input_extra.is_array()) {
+                            for (const auto & chunk : slot.params.input_extra) {
+                                std::string text;
+                                std::string filename = "tmp";
+                                if (chunk.is_object()) {
+                                    text     = chunk.value("text",     std::string());
+                                    filename = chunk.value("filename", std::string("tmp"));
+                                } else if (chunk.is_string()) {
+                                    text = chunk.get<std::string>();
+                                } else if (chunk.is_number()) {
+                                    extra_tokens.push_back(chunk.get<llama_token>());
+                                    continue;
+                                }
+                                if (fim_sep != LLAMA_TOKEN_NULL && !text.empty()) {
+                                    extra_tokens.push_back(fim_sep);
+                                    auto fname_tok = ::common_tokenize(ctx, filename + "\n", false, true);
+                                    extra_tokens.insert(extra_tokens.end(), fname_tok.begin(), fname_tok.end());
+                                }
+                                if (!text.empty()) {
+                                    auto tok = ::common_tokenize(ctx, text, false, true);
+                                    extra_tokens.insert(extra_tokens.end(), tok.begin(), tok.end());
+                                }
+                            }
+                        }
+
+                        // constrain sizes to fit within batch and context windows
+                        const int n_prefix_take = std::min<int>(prefix_tokens.size(), 3 * (params_base.n_batch / 4));
+                        const int n_suffix_take = std::min<int>(suffix_tokens.size(), std::max<int>(0, params_base.n_batch / 4 - 2));
+                        const int n_extra_take  = std::min<int>(std::max<int>(0, slot.n_ctx - params_base.n_batch - 2 * params_base.n_predict), (int)extra_tokens.size());
+
+                        // keep only the last n_prefix_take tokens (closest to cursor)
+                        prefix_tokens.erase(prefix_tokens.begin(), prefix_tokens.begin() + prefix_tokens.size() - n_prefix_take);
+                        suffix_tokens.resize(n_suffix_take);
+                        extra_tokens.erase(extra_tokens.begin(), extra_tokens.end() - n_extra_take);
+
                         prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model));
                         suffix_tokens.insert(suffix_tokens.begin(), llama_token_suffix(model));
 
@@ -3787,6 +3835,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         if (add_bos) {
                             embd_inp.insert(embd_inp.begin(), llama_token_bos(model));
                         }
+                        // prepend extra context BEFORE BOS for a stable KV-cache prefix
+                        embd_inp.insert(embd_inp.begin(), extra_tokens.begin(), extra_tokens.end());
                         embd_inp.insert(embd_inp.end(), embd_end.begin(), embd_end.end());
 
                         const llama_token middle_token = llama_token_middle(model);

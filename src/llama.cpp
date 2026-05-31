@@ -9740,6 +9740,14 @@ llama_token llama_token_eot(const struct llama_model * model) {
     return model->vocab.token_eot();
 }
 
+llama_token llama_vocab_fim_rep(const struct llama_vocab * vocab) {
+    return vocab->token_fim_rep();
+}
+
+llama_token llama_vocab_fim_sep(const struct llama_vocab * vocab) {
+    return vocab->token_fim_sep();
+}
+
 //
 // tokenization
 //

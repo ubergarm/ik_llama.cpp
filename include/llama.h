@@ -1153,6 +1153,10 @@ extern "C" {
     LLAMA_API llama_token llama_token_suffix(const struct llama_model * model); // Beginning of infill suffix
     LLAMA_API llama_token llama_token_eot   (const struct llama_model * model); // End of infill middle
 
+    // Repo-level FIM tokens (optional, may return LLAMA_TOKEN_NULL)
+    LLAMA_API llama_token llama_vocab_fim_rep(const struct llama_vocab * vocab); // Repository marker
+    LLAMA_API llama_token llama_vocab_fim_sep(const struct llama_vocab * vocab); // File separator
+
     //
     // Tokenization
     //
