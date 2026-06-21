@@ -392,4 +392,14 @@ struct server_context {
     void create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base);
 
     void release_slot_after_final_response(server_slot & slot);
+
+    // Model unload/reload
+    bool unload_model();        // Free context only (KV cache, compute buffers), keep model in RAM
+    bool reload_model();        // Re-create context from existing model (fast, weights stay in RAM)
+    bool full_unload_model();   // Destroy model, draft, mctx, lora — all VRAM freed
+    bool full_reload_model();   // Rebuild everything from params_base (disk → GPU)
+    bool can_reload() const { return model != nullptr && ctx == nullptr; }
+    bool is_unloaded() const { return model != nullptr && ctx == nullptr; }
+    bool is_fully_unloaded() const { return model == nullptr && ctx == nullptr; }
+    void clear_slots();         // Clear all per-slot resources (sampler, draft ctx, batch)
 };

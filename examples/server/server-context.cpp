@@ -195,6 +195,227 @@ server_context::~server_context() {
     llama_batch_free(batch);
 }
 
+//
+// Model unload/reload — free VRAM while keeping model weights cached in RAM
+//
+
+void server_context::clear_slots() {
+    for (server_slot& slot : slots) {
+        if (slot.ctx_sampling != nullptr) {
+            common_sampler_free(slot.ctx_sampling);
+            slot.ctx_sampling = nullptr;
+        }
+        common_speculative_free(slot.spec);
+        slot.spec = nullptr;
+        slot.reset();
+    }
+}
+
+bool server_context::unload_model() {
+    if (ctx == nullptr) {
+        return false; // already unloaded
+    }
+
+    // Wait for all slots to become idle
+    while (!slots_idle()) {
+        update_slots();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Clear per-slot resources (samplers, draft contexts, speculative state)
+    clear_slots();
+
+    // Free main context (KV cache, compute buffers = VRAM)
+    // Model weights are NOT freed — they stay mmap'd in RAM
+    llama_free(ctx);
+    ctx = nullptr;
+
+    // Reset state flags
+    clean_kv_cache = true;
+    add_bos_token = true;
+    has_eos_token = false;
+    system_need_update = false;
+    system_tokens.clear();
+
+    // Clear vocab pieces
+    vocab_pieces.clear();
+    max_piece_len = 0;
+
+    // Free batch
+    llama_batch_free(batch);
+    batch = {};
+
+    return true;
+}
+
+bool server_context::reload_model() {
+    if (ctx != nullptr) {
+        return false; // already loaded
+    }
+    if (model == nullptr) {
+        return false; // no model to reload from
+    }
+
+    // Re-create context from existing model using saved params
+    llama_context_params cparams = common_context_params_to_llama(params_base);
+    ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        return false;
+    }
+
+    n_ctx = llama_n_ctx(ctx);
+    add_bos_token = llama_should_add_bos_token(model);
+    has_eos_token = llama_add_eos_token(model) != 1;
+
+    // Re-initialize slots (rebuilds slot state, draft contexts, samplers, etc.)
+    slots.clear();
+    init();
+    clean_kv_cache = false;
+
+    return true;
+}
+
+bool server_context::full_unload_model() {
+    if (ctx == nullptr && model == nullptr) {
+        return false; // already fully unloaded
+    }
+
+    // Wait for all slots to become idle
+    while (!slots_idle()) {
+        update_slots();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Clear per-slot resources (samplers, draft contexts, speculative state)
+    clear_slots();
+
+    // Free main context (KV cache, compute buffers = VRAM)
+    llama_free(ctx);
+    ctx = nullptr;
+
+    // Free draft model weights (speculative decoding) — frees GPU buffers
+    if (params_base.speculative.model_dft) {
+        llama_free_model(params_base.speculative.model_dft);
+        params_base.speculative.model_dft = nullptr;
+    }
+
+    // Free multimodal context (may hold GPU memory for vision projector)
+    mtmd_free(mctx);
+    mctx = nullptr;
+
+    // Free LoRA adapters (GPU tensors)
+    for (auto & la : lora_adapters) {
+        llama_lora_adapter_free(la.adapter);
+        la.adapter = nullptr;
+    }
+    lora_adapters.clear();
+
+    // Control vectors are just std::vector<float>, self-managing — clear() suffices
+    control_vectors.clear();
+
+    // Free model weights — this frees the actual GPU buffers (cudaMalloc)
+    if (model) {
+        llama_free_model(model);
+        model = nullptr;
+    }
+
+    // Reset state flags
+    clean_kv_cache = true;
+    add_bos_token = true;
+    has_eos_token = false;
+    system_need_update = false;
+    system_tokens.clear();
+
+    // Clear vocab pieces
+    vocab_pieces.clear();
+    max_piece_len = 0;
+
+    // Free batch
+    llama_batch_free(batch);
+    batch = {};
+
+    return true;
+}
+
+bool server_context::full_reload_model() {
+    if (ctx != nullptr || model != nullptr) {
+        return false; // already loaded
+    }
+    if (params_base.model.empty()) {
+        return false; // no model path to reload from
+    }
+
+    // Load model + context + LoRA from disk
+    llama_init_result llama_init = llama_init_from_gpt_params(params_base);
+
+    model = llama_init.model;
+    ctx = llama_init.context;
+    lora_adapters = llama_init.lora_adapters;
+
+    if (model == nullptr) {
+        LOG_ERROR("failed to reload model from disk", { {"model", params_base.model} });
+        return false;
+    }
+
+    n_ctx = llama_n_ctx(ctx);
+    add_bos_token = llama_should_add_bos_token(model);
+    has_eos_token = llama_add_eos_token(model) != 1;
+
+    // Prepare speculative decoding (handles MTP + parallel slot conflict)
+    common_speculative_prepare_startup(params_base, false);
+
+    // Reload multimodal context if configured
+    std::string& mmproj_path = params_base.mmproj.path;
+    if (!mmproj_path.empty()) {
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu = params_base.mmproj_use_gpu;
+        mparams.print_timings = false;
+        mparams.n_threads = params_base.n_threads_mtmd != -1 ? params_base.n_threads_mtmd
+                             : params_base.n_threads_batch != -1 ? params_base.n_threads_batch
+                                                                 : params_base.n_threads;
+        mparams.flash_attn_type = params_base.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        mparams.verbosity = params_base.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
+        mparams.image_min_tokens = params_base.image_min_tokens;
+        mparams.image_max_tokens = params_base.image_max_tokens;
+        mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
+        if (mctx == nullptr) {
+            LOG_ERROR("failed to reload multimodal model, '%s'", { {"mmproj", mmproj_path} });
+            llama_free(ctx);
+            ctx = nullptr;
+            llama_free_model(model);
+            model = nullptr;
+            for (auto & la : lora_adapters) {
+                llama_lora_adapter_free(la.adapter);
+            }
+            lora_adapters.clear();
+            return false;
+        }
+    }
+
+    // Load draft model and finalize MTP via the common speculative API
+    // (replaces the old inline draft-loading + MTP-check blocks)
+    if (!common_speculative_finalize_startup(params_base, model)) {
+        LOG_ERROR("failed to finalize speculative startup during full reload", {});
+        if (mctx) { mtmd_free(mctx); mctx = nullptr; }
+        llama_free(ctx);
+        ctx = nullptr;
+        llama_free_model(model);
+        model = nullptr;
+        for (auto & la : lora_adapters) {
+            llama_lora_adapter_free(la.adapter);
+        }
+        lora_adapters.clear();
+        return false;
+    }
+
+    // Re-initialize slots (rebuilds slot state, draft contexts, samplers, etc.)
+    slots.clear();
+    init();
+    clean_kv_cache = false;
+
+    return true;
+}
+
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
 

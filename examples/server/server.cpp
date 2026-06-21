@@ -65,6 +65,8 @@ bool server_log_json = true;
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
+    SERVER_STATE_UNLOADED,       // Model unloaded (context freed, weights cached in RAM)
+    SERVER_STATE_FULLY_UNLOADED, // Model fully unloaded (all resources destroyed, VRAM freed)
     SERVER_STATE_ERROR           // An error occurred, load_model failed
 };
 
@@ -696,6 +698,22 @@ int main(int argc, char ** argv) {
             }
             return false;
         }
+        if (current_state == SERVER_STATE_UNLOADED) {
+            // Allow load/unload endpoints and health checks when unloaded
+            if (req.path == "/models/load" || req.path == "/models/unload" || req.path == "/health" || req.path == "/v1/health") {
+                return true;
+            }
+            res_err(res, format_error_response("Model is unloaded, call POST /models/load first", ERROR_TYPE_UNAVAILABLE));
+            return false;
+        }
+        if (current_state == SERVER_STATE_FULLY_UNLOADED) {
+            // Allow load endpoint and health checks when fully unloaded
+            if (req.path == "/models/load" || req.path == "/health" || req.path == "/v1/health") {
+                return true;
+            }
+            res_err(res, format_error_response("Model is fully unloaded, call POST /models/load first", ERROR_TYPE_UNAVAILABLE));
+            return false;
+        }
         return true;
     };
 
@@ -777,10 +795,145 @@ int main(int argc, char ** argv) {
                 {
                     res_err(res, format_error_response("Loading model", ERROR_TYPE_UNAVAILABLE));
                 } break;
+            case SERVER_STATE_UNLOADED:
+                {
+                    json health = {
+                        {"status", "unloaded"},
+                        {"unload_allowed", false},
+                        {"load_allowed", true},
+                    };
+                    res.status = 503; // HTTP Service Unavailable
+                    res.set_content(health.dump(), "application/json");
+                } break;
+            case SERVER_STATE_FULLY_UNLOADED:
+                {
+                    json health = {
+                        {"status", "fully_unloaded"},
+                        {"unload_allowed", false},
+                        {"load_allowed", true},
+                    };
+                    res.status = 503; // HTTP Service Unavailable
+                    res.set_content(health.dump(), "application/json");
+                } break;
             case SERVER_STATE_ERROR:
                 {
                     res_err(res, format_error_response("Model failed to load", ERROR_TYPE_SERVER));
                 } break;
+        }
+    };
+
+    //
+    // Model unload/load endpoints
+    // Body: {"full": true|false}, defaults to true
+    // full=true: destroy all model resources (VRAM freed, reload from disk)
+    // full=false: free context only (weights cached in RAM, fast reload)
+    //
+
+    const auto handle_models_unload = [&ctx_server, &state](const httplib::Request & req, httplib::Response & res) {
+        if (state.load() != SERVER_STATE_READY) {
+            res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Parse optional "full" flag from request body (default: true)
+        bool full = true;
+        if (!req.body.empty()) {
+            try {
+                json body = json::parse(req.body);
+                if (body.contains("full")) {
+                    full = body["full"].get<bool>();
+                }
+            } catch (...) {
+                // ignore parse errors, default to full=true
+            }
+        }
+
+        if (full) {
+            state.store(SERVER_STATE_FULLY_UNLOADED);
+            if (!ctx_server.full_unload_model()) {
+                state.store(SERVER_STATE_ERROR);
+                res_err(res, format_error_response("failed to fully unload model", ERROR_TYPE_SERVER));
+                return;
+            }
+            LOG_INFO("Model fully unloaded (all VRAM freed)", {});
+            state.store(SERVER_STATE_FULLY_UNLOADED);
+            res_ok(res, {{"success", true}, {"state", "fully_unloaded"}, {"full", true}});
+        } else {
+            state.store(SERVER_STATE_UNLOADED);
+            if (!ctx_server.unload_model()) {
+                state.store(SERVER_STATE_ERROR);
+                res_err(res, format_error_response("failed to unload model", ERROR_TYPE_SERVER));
+                return;
+            }
+            LOG_INFO("Model unloaded (weights cached in RAM)", {});
+            state.store(SERVER_STATE_UNLOADED);
+            res_ok(res, {{"success", true}, {"state", "unloaded"}, {"full", false}});
+        }
+    };
+
+    const auto handle_models_load = [&ctx_server, &state](const httplib::Request & req, httplib::Response & res) {
+        auto current_state = state.load();
+        if (current_state != SERVER_STATE_UNLOADED && current_state != SERVER_STATE_FULLY_UNLOADED) {
+            res_err(res, format_error_response("model is not in unloaded state", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Parse optional "full" flag from request body — must match unload mode
+        bool full = true;
+        if (!req.body.empty()) {
+            try {
+                json body = json::parse(req.body);
+                if (body.contains("full")) {
+                    full = body["full"].get<bool>();
+                }
+            } catch (...) {
+                // ignore parse errors, default to full=true
+            }
+        }
+
+        state.store(SERVER_STATE_LOADING_MODEL);
+
+        if (full && current_state == SERVER_STATE_FULLY_UNLOADED) {
+            // Full reload: rebuild everything from disk
+            if (!ctx_server.full_reload_model()) {
+                state.store(SERVER_STATE_ERROR);
+                res_err(res, format_error_response("failed to fully reload model", ERROR_TYPE_SERVER));
+                return;
+            }
+            LOG_INFO("Model fully reloaded (VRAM restored)", {});
+            state.store(SERVER_STATE_READY);
+            res_ok(res, {{"success", true}, {"state", "ready"}, {"full", true}});
+        } else if (!full && current_state == SERVER_STATE_UNLOADED) {
+            // Fast reload: re-create context from in-memory model
+            if (!ctx_server.reload_model()) {
+                state.store(SERVER_STATE_ERROR);
+                res_err(res, format_error_response("failed to reload model", ERROR_TYPE_SERVER));
+                return;
+            }
+            LOG_INFO("Model reloaded (fast, weights from cache)", {});
+            state.store(SERVER_STATE_READY);
+            res_ok(res, {{"success", true}, {"state", "ready"}, {"full", false}});
+        } else {
+            // Mismatched full flag — auto-resolve based on current state
+            if (current_state == SERVER_STATE_FULLY_UNLOADED) {
+                if (!ctx_server.full_reload_model()) {
+                    state.store(SERVER_STATE_ERROR);
+                    res_err(res, format_error_response("failed to fully reload model", ERROR_TYPE_SERVER));
+                    return;
+                }
+                LOG_INFO("Model fully reloaded (auto-resolved from fully_unloaded state)", {});
+                state.store(SERVER_STATE_READY);
+                res_ok(res, {{"success", true}, {"state", "ready"}, {"full", true}});
+            } else {
+                if (!ctx_server.reload_model()) {
+                    state.store(SERVER_STATE_ERROR);
+                    res_err(res, format_error_response("failed to reload model", ERROR_TYPE_SERVER));
+                    return;
+                }
+                LOG_INFO("Model reloaded (auto-resolved from unloaded state)", {});
+                state.store(SERVER_STATE_READY);
+                res_ok(res, {{"success", true}, {"state", "ready"}, {"full", false}});
+            }
         }
     };
 
@@ -2118,6 +2271,9 @@ int main(int argc, char ** argv) {
     svr->Get ("/props",               handle_props);
     svr->Get("/v1/props",             handle_props_simple);
     svr->Get ("/v1/models",           handle_models);
+    // Model unload/load
+    svr->Post("/models/unload",       handle_models_unload);
+    svr->Post("/models/load",         handle_models_load);
     svr->Post("/completion",          handle_completions); // legacy
     svr->Post("/completions", handle_completions); // legacy
     svr->Post("/v1/completions",     handle_completions_oai);
